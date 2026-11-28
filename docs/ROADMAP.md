@@ -187,13 +187,18 @@
 
 ---
 
-## Future Roadmap
+### Completed Direction P (`v0.8.0` Carryover) — Distributed Multi-GPU EoR & Sub-160 GiB `2048³` 2LPT Streaming
+- **Shared Filter Math & Y-Slab Filtering (`cuda_filters.cuh`, `cuda_cufft.cu`, `cuda_mgpu.cu`/`.cuh`)**:
+  - Consolidated all 6 k-space filter weights (tophat, sharp-k, Gaussian, exponential MFP, spherical shell straight-line, and multiple-scattering `2F3` asymptotics) into [`cuda_filters.cuh`](../src/py21cmfast/src/cuda/cuda_filters.cuh).
+  - Extended `cuda_mgpu.cu` with `P21_CUDA_MGPU_VIRTUAL_RANKS` (allowing 2+ virtual Y-slab ranks on single-GPU systems), `p21_mgpu_r2c_from_device`, `p21_mgpu_filter_yslabs`, `p21_mgpu_c2r_to_device`, and the C/CFFI `p21_cuda_mgpu_filter_box_host` entry point (`47` CFFI CUDA symbols / `83` CUDA APIs).
+- **Sub-160 GiB `2048³` 2LPT Host Streaming (`cuda_ic.cu`)**:
+  - Replaced the three simultaneous full-grid diagonal host buffers with strip-streamed accumulation across `a=0, 1, 2`, freed the single auxiliary diagonal buffer before `phi2` R2C, reused `h_saved_input` for `h_phi2_k` in `single_slab_mode`, removed the `boxes->hires_vx_2LPT` allocation dependency when `PERTURB_ON_HIGH_RES=False`, and added `P21_CUDA_MGPU_2LPT_HOST_STREAM=1`.
+- **Distributed EoR Filtering (`cuda_ionization.cu`, `cuda_radiation.cu`)**:
+  - Wired `p21_mgpu_eor_enabled` distributed Y-slab FFT and k-space filtering into both `IonizedBox` (including `P21_CUDA_ION_SPILL_KSPACE` host spilling) and `RadiationFields` / `SpinTemperature`, verified against single-GPU parity using virtual ranks in [`tests/native/test_21cmcu_phase15_direction_p.py`](../tests/native/test_21cmcu_phase15_direction_p.py).
 
-### Release `v0.8.0` — Extreme-Scale Multi-GPU EoR (Direction P)
-- **Direction P — Large-Scale Multi-GPU EoR & Sub-160 GiB `2048³` 2LPT Streaming**:
-  - **Targets**: `src/py21cmfast/src/cuda_mgpu.cu`, `cuda_ic.cu`, `cuda_ionization.cu`, `cuda_radiation.cu`.
-  - **Scope**: Extend distributed Y-slab decomposition to multi-GPU `1024³` full EoR evolution (`IonizedBox` / `TsBox`) and slab-streamed `<160 GiB` host-RAM `2048³` 2LPT IC on `3×–4× 24 GB` GPUs.
-  - **Acceptance Criteria**: Numerical parity vs single-GPU/CPU at `256³` and `512³`, plus verified native `1024³` EoR & `2048³` 2LPT execution within 24 GB-per-GPU VRAM.
+---
+
+## Future Roadmap
 
 ### Release `v1.0.0` — Multi-Node NCCL, Large-Volume Benchmarks & Paper Finalization
 - **Multi-GPU Multi-Probe Scaling**: Joint EoR + galaxy + CMB secondary likelihood benchmarks across `256³–1024³` volumes on multi-GPU nodes.

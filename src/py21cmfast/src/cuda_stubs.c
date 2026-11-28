@@ -899,6 +899,23 @@ int p21_cuda_cic_deposit_3d(const float *h_pos_xyz, const float *h_weights,
     return -1;
 }
 
+int p21_cuda_mgpu_filter_box_host(const float *h_in, float *h_out, int nx, int ny, int nz,
+                                  double box_len, double non_cubic_factor, int filter_type, float R,
+                                  float R_param, float R_star) {
+    (void)h_in;
+    (void)h_out;
+    (void)nx;
+    (void)ny;
+    (void)nz;
+    (void)box_len;
+    (void)non_cubic_factor;
+    (void)filter_type;
+    (void)R;
+    (void)R_param;
+    (void)R_star;
+    return -1;
+}
+
 #else
 
 typedef int p21_cuda_stubs_unused_translation_unit_t;

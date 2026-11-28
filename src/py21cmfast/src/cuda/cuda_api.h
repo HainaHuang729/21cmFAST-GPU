@@ -320,6 +320,11 @@ int p21_cuda_cic_deposit_3d(const float *h_pos_xyz, const float *h_weights,
                             unsigned long long n_particles, int nx, int ny, int nz, double lx,
                             double ly, double lz, int overdensity, float *h_grid_out);
 
+/* Direction P: Distributed multi-GPU Y-slab k-space filtering */
+int p21_cuda_mgpu_filter_box_host(const float *h_in, float *h_out, int nx, int ny, int nz,
+                                  double box_len, double non_cubic_factor, int filter_type, float R,
+                                  float R_param, float R_star);
+
 #ifdef __cplusplus
 }
 #endif

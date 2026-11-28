@@ -592,6 +592,11 @@ bool mgpu_ic_force_single_slab(void) {
     return env && strcmp(env, "1") == 0;
 }
 
+bool mgpu_ic_force_2lpt_host_stream(void) {
+    const char *env = getenv("P21_CUDA_MGPU_2LPT_HOST_STREAM");
+    return env && strcmp(env, "1") == 0;
+}
+
 template <typename Fn>
 bool mgpu_ic_parallel(int n_workers, Fn &&fn) {
     if (n_workers <= 1) {
@@ -1283,7 +1288,8 @@ int run_mgpu_compute_initial_conditions(unsigned long long int random_seed, Init
     /* 5. 2LPT velocities */
     if (ok && matter_options_global->PERTURB_ALGORITHM == PERTURB_ALGORITHM_2LPT) {
         const size_t min_free_2lpt = p21_mgpu_min_free_mem(grid);
-        const bool fit_2lpt_gpu = (min_free_2lpt >= 2ULL * max_real_x_bytes + (768ULL << 20));
+        const bool fit_2lpt_gpu = !mgpu_ic_force_2lpt_host_stream() &&
+                                  (min_free_2lpt >= 2ULL * max_real_x_bytes + (768ULL << 20));
         const int pairs[3][2] = {{0, 1}, {0, 2}, {1, 2}};
         cufftComplex *h_phi2_k = nullptr;
 
@@ -1464,10 +1470,21 @@ int run_mgpu_compute_initial_conditions(unsigned long long int random_seed, Init
                 p21_mgpu_free(grid.devs[g], d_phi2[(size_t)g], grid.streams[g]);
             }
         } else {
-            /* Hybrid host-accumulated 2LPT (Direction K: streaming off-diagonal subtraction
-             * eliminates h_tmp_ab, and std::thread parallelizes diagonal host combine). */
+            /* Streaming host-accumulated 2LPT (Direction P: stream diagonals a=0,1,2 through one
+             * host buffer instead of three full diag grids, keeping 2048^3 peak host RAM < 160 GiB). */
             float *h_phi2 = (float *)calloc(hi_pixels, sizeof(float));
-            if (!h_phi2 || !boxes->hires_vx_2LPT || !boxes->hires_vy_2LPT || !boxes->hires_vz_2LPT) {
+            float *h_diag_own = nullptr;
+            float *h_diag = nullptr;
+            if (h_phi2) {
+                if (perturb_hires && boxes->hires_vx_2LPT) {
+                    h_diag = boxes->hires_vx_2LPT;
+                } else {
+                    h_diag_own = (float *)malloc(hi_pixels * sizeof(float));
+                    h_diag = h_diag_own;
+                }
+            }
+            if (!h_phi2 || !h_diag) {
+                free(h_diag_own);
                 free(h_phi2);
                 ok = false;
             } else {
@@ -1508,8 +1525,11 @@ int run_mgpu_compute_initial_conditions(unsigned long long int random_seed, Init
                     }
                 }
 
-                float *diag_host[3] = {boxes->hires_vx_2LPT, boxes->hires_vy_2LPT,
-                                       boxes->hires_vz_2LPT};
+                float *opt_diag_out[3] = {
+                    (!perturb_hires ? boxes->hires_vx_2LPT : nullptr),
+                    (!perturb_hires ? boxes->hires_vy_2LPT : nullptr),
+                    (!perturb_hires ? boxes->hires_vz_2LPT : nullptr),
+                };
                 for (int a = 0; ok && a < 3; ++a) {
                     ok = prepare_base_kspace_in_work();
                     if (ok) {
@@ -1524,26 +1544,48 @@ int run_mgpu_compute_initial_conditions(unsigned long long int random_seed, Init
                         });
                     }
                     if (ok) {
-                        ok = c2r_to_host(diag_host[a], 1.0);
+                        ok = p21_mgpu_fft_c2r_strips(
+                            grid, d_work.data(), h_stage,
+                            [&](int g, int x_global_start, int cur_nx, float *d_strip,
+                                cudaStream_t stream) -> bool {
+                                size_t elems = (size_t)cur_nx * plane_real;
+                                size_t bytes = elems * sizeof(float);
+                                float *bounce = (float *)h_strip_bounce[(size_t)g].ptr;
+                                if (!P21_CUDA_OK(cudaMemcpyAsync(bounce, d_strip, bytes,
+                                                                 cudaMemcpyDeviceToHost, stream)) ||
+                                    !P21_CUDA_OK(cudaStreamSynchronize(stream))) {
+                                    return false;
+                                }
+                                size_t offset = (size_t)x_global_start * plane_real;
+                                if (opt_diag_out[a]) {
+                                    memcpy(opt_diag_out[a] + offset, bounce, bytes);
+                                }
+                                float *diag = h_diag + offset;
+                                float *rhs = h_phi2 + offset;
+                                if (a == 0) {
+                                    memcpy(diag, bounce, bytes);
+                                } else if (a == 1) {
+                                    for (size_t i = 0; i < elems; ++i) {
+                                        double d0 = (double)diag[i];
+                                        double d1 = (double)bounce[i];
+                                        rhs[i] = (float)((double)rhs[i] + d0 * d1);
+                                        diag[i] = (float)(d0 + d1);
+                                    }
+                                } else {
+                                    for (size_t i = 0; i < elems; ++i) {
+                                        double d01 = (double)diag[i];
+                                        double d2 = (double)bounce[i];
+                                        rhs[i] = (float)((double)rhs[i] + d01 * d2);
+                                    }
+                                }
+                                return true;
+                            });
                     }
                 }
+                free(h_diag_own);
+                h_diag_own = nullptr;
+                h_diag = nullptr;
                 if (ok) {
-                    const float *d0p = boxes->hires_vx_2LPT;
-                    const float *d1p = boxes->hires_vy_2LPT;
-                    const float *d2p = boxes->hires_vz_2LPT;
-                    int n_cpu = std::min(16, std::max(1, simulation_options_global->N_THREADS));
-                    mgpu_ic_parallel(n_cpu, [&](int tid) -> bool {
-                        size_t chunk = (hi_pixels + (size_t)n_cpu - 1) / (size_t)n_cpu;
-                        size_t i0 = (size_t)tid * chunk;
-                        size_t i1 = std::min(hi_pixels, i0 + chunk);
-                        for (size_t i = i0; i < i1; ++i) {
-                            double d0 = (double)d0p[i];
-                            double d1 = (double)d1p[i];
-                            double d2 = (double)d2p[i];
-                            h_phi2[i] = (float)((double)h_phi2[i] + d0 * d1 + (d0 + d1) * d2);
-                        }
-                        return true;
-                    });
                     double norm_2lpt = 1.0 / (volume * volume * (double)hi_pixels);
                     cufftComplex **phi2_dst = single_slab_mode ? d_work.data() : d_saved.data();
                     ok = p21_mgpu_fft_r2c_from_host(grid, h_phi2, norm_2lpt, phi2_dst, h_stage);
@@ -1554,7 +1596,12 @@ int run_mgpu_compute_initial_conditions(unsigned long long int random_seed, Init
         }
 
         if (ok && single_slab_mode) {
-            h_phi2_k = (cufftComplex *)malloc(grid.total_cplx_elems() * sizeof(cufftComplex));
+            if (h_saved_input) {
+                h_phi2_k = h_saved_input;
+                h_saved_input = nullptr;
+            } else {
+                h_phi2_k = (cufftComplex *)malloc(grid.total_cplx_elems() * sizeof(cufftComplex));
+            }
             ok = (h_phi2_k != nullptr) && spill_yslabs_to_host(d_work.data(), h_phi2_k);
         }
 
@@ -1747,7 +1794,7 @@ extern "C" int p21_cuda_compute_initial_conditions(unsigned long long int random
         vcb_spline.n,
     };
 
-    if (ok && p21_cuda_get_num_devices() >= 2 &&
+    if (ok && p21_mgpu_effective_ranks() >= 2 &&
         (p21_cuda_get_fast_ic() != 0 || non_zero_input) &&
         (hi_bytes >= 512ULL * 1024 * 1024 || mgpu_ic_force_enabled())) {
         if (run_mgpu_compute_initial_conditions(

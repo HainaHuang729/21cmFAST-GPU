@@ -3,6 +3,11 @@
 All notable milestones in **21cmCU** are documented in this file.
 
 ## [Unreleased]
+### Direction P — Distributed Multi-GPU EoR & Sub-160 GiB `2048³` 2LPT Streaming
+- Shared k-space filter weights in [`cuda_filters.cuh`](src/py21cmfast/src/cuda/cuda_filters.cuh) across `cuda_cufft.cu` and `cuda_mgpu.cu`; added `p21_mgpu_r2c_from_device`, `p21_mgpu_filter_yslabs`, `p21_mgpu_c2r_to_device`, `P21_CUDA_MGPU_VIRTUAL_RANKS`, and `p21_cuda_mgpu_filter_box_host` (`83` CUDA APIs / `47` CFFI exports).
+- Upgraded `cuda_ic.cu` host-accumulated `2LPT` (`P21_CUDA_MGPU_2LPT_HOST_STREAM=1`) to stream diagonals `a=0, 1, 2` strip-by-strip through a single auxiliary buffer, reuse `h_saved_input` in `single_slab_mode`, and work cleanly with `PERTURB_ON_HIGH_RES=False` (`<160 GiB` peak host RAM at `2048³`).
+- Wired distributed Y-slab filtering into `cuda_ionization.cu` and `cuda_radiation.cu` behind `p21_mgpu_eor_enabled`, updated [`src/py21cmcu/doctor.py`](src/py21cmcu/doctor.py), and added virtual-rank parity coverage in [`tests/native/test_21cmcu_phase15_direction_p.py`](tests/native/test_21cmcu_phase15_direction_p.py).
+
 ### Architecture Modernization
 - Split `cuda_analysis.cu` (`3,056` lines) into four domain translation units (`cuda_lightcone_ps.cu`, `cuda_observables.cu`, `cuda_topology.cu`, `cuda_multiprobe.cu`) backed by shared RAII + grid-stride header [`cuda_analysis_common.cuh`](src/py21cmfast/src/cuda/cuda_analysis_common.cuh).
 - Upgraded [`build_cffi.py`](build_cffi.py) with concurrent `nvcc` compilation (`P21_NVCC_JOBS`) and `build/compile_commands.json` generation, and added [`scripts/check_cuda_abi.py`](scripts/check_cuda_abi.py) (`--stub-skeleton`) wired into CI for 1:1 `cuda_api.h` / `cuda_stubs.c` / `cuda/*.cu` parity.

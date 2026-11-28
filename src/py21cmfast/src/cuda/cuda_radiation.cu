@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "cuda_common.cuh"
+#include "cuda_mgpu.cuh"
 #include "cuda_tables.cuh"
 
 namespace {
@@ -619,6 +620,59 @@ __global__ void multiply_radiation_constants_kernel(
     }
 }
 
+bool mgpu_alloc_rad_slabs(const P21MgpuGrid &grid, std::vector<cufftComplex *> &y) {
+    y.assign((size_t)grid.n_gpus, nullptr);
+    for (int g = 0; g < grid.n_gpus; ++g) {
+        y[(size_t)g] = (cufftComplex *)p21_mgpu_malloc(
+            grid.devs[g], grid.cplx_elems_y(g) * sizeof(cufftComplex), grid.streams[g]);
+        if (!y[(size_t)g]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void mgpu_free_rad_slabs(const P21MgpuGrid &grid, std::vector<cufftComplex *> &y) {
+    for (int g = 0; g < (int)y.size() && g < grid.n_gpus; ++g) {
+        if (y[(size_t)g]) {
+            p21_mgpu_free(grid.devs[g], y[(size_t)g], grid.streams[g]);
+            y[(size_t)g] = nullptr;
+        }
+    }
+    y.clear();
+}
+
+bool mgpu_filter_device_real_pair(float *d_in_and_out1, float *d_opt_out2, int nx, int ny, int nz,
+                                  double box_len, double ncf, int filter_type1, int filter_type2,
+                                  double R_inner, double R_outer, double R_star,
+                                  cudaStream_t stream) {
+    P21MgpuGrid grid;
+    if (!grid.init(nx, ny, nz)) {
+        return false;
+    }
+    std::vector<cufftComplex *> d_y_work, d_y_unfilt;
+    bool dual = (d_opt_out2 != nullptr);
+    bool ok = mgpu_alloc_rad_slabs(grid, d_y_work) && (!dual || mgpu_alloc_rad_slabs(grid, d_y_unfilt));
+    float pre_scale = 1.0f / (float)((size_t)nx * (size_t)ny * (size_t)nz);
+    if (ok) {
+        cufftComplex **r2c_dst = dual ? d_y_unfilt.data() : d_y_work.data();
+        ok = p21_mgpu_r2c_from_device(grid, d_in_and_out1, stream, 1.0, r2c_dst, nullptr) &&
+             p21_mgpu_filter_yslabs(grid, r2c_dst, d_y_work.data(), box_len, ncf, filter_type1,
+                                    (float)R_inner, (float)R_outer, (float)R_star, pre_scale) &&
+             p21_mgpu_c2r_to_device(grid, d_y_work.data(), d_in_and_out1, stream, nullptr);
+        if (ok && dual) {
+            ok = p21_mgpu_filter_yslabs(grid, d_y_unfilt.data(), d_y_work.data(), box_len, ncf,
+                                        filter_type2, (float)R_inner, (float)R_outer, (float)R_star,
+                                        pre_scale) &&
+                 p21_mgpu_c2r_to_device(grid, d_y_work.data(), d_opt_out2, stream, nullptr);
+        }
+    }
+    mgpu_free_rad_slabs(grid, d_y_unfilt);
+    mgpu_free_rad_slabs(grid, d_y_work);
+    grid.destroy();
+    return ok;
+}
+
 /* Filter one real grid on GPU without polluting DeviceFieldRegistry with ephemeral interp boxes. */
 bool filter_one_ephemeral_shell(const float *host_src, int nx, int ny, int nz, double box_len,
                                 double ncf, int R_ct, double R_inner, double R_outer, double R_star,
@@ -642,6 +696,17 @@ bool filter_one_ephemeral_shell(const float *host_src, int nx, int ny, int nz, d
         clamp_nonneg_kernel<<<grid, kBlockThreads, 0, stream>>>(d_out, n);
         bool ok = P21_CUDA_OK(cudaGetLastError());
         if (!ok) {
+            p21_cuda_pool_free(d_out, stream);
+            return false;
+        }
+        *d_real_out = d_out;
+        *d_kspace_out = nullptr;
+        return true;
+    }
+
+    if (!keep_kspace && p21_mgpu_eor_enabled(n)) {
+        if (!mgpu_filter_device_real_pair(d_out, nullptr, nx, ny, nz, box_len, ncf, filter_type,
+                                          filter_type, R_inner, R_outer, R_star, stream)) {
             p21_cuda_pool_free(d_out, stream);
             return false;
         }
@@ -1349,34 +1414,56 @@ extern "C" int p21_cuda_update_radiation_fields(float redshift, EmissivityFields
     cufftComplex *d_k_unused = nullptr;
 
     bool keep_k_lw = (use_mcgs && lya_ms && R_ct > 0 && R_inner > 0.0);
-    bool ok =
-        filter_one_ephemeral_shell(emissivity_fields->sfrd_acg, nx, ny, nz, box_len, ncf, R_ct,
-                                   R_inner, R_outer, R_star, lya_filter_type, keep_k_lw,
-                                   &d_sfr_acg_lya, &d_k_acg, stream) &&
-        filter_one_ephemeral_shell(emissivity_fields->xray_emissivity, nx, ny, nz, box_len, ncf,
-                                   R_ct, R_inner, R_outer, R_star,
-                                   FILTER_SPHERICAL_SHELL_STRAIGHT_LINE, false, &d_xray_filt,
-                                   &d_k_unused, stream);
-
-    if (ok && use_mcgs) {
-        ok = filter_one_ephemeral_shell(emissivity_fields->sfrd_mcg, nx, ny, nz, box_len, ncf, R_ct,
+    bool mgpu_dual = (keep_k_lw && p21_mgpu_eor_enabled(total));
+    bool ok = true;
+    if (mgpu_dual) {
+        size_t fbytes = total * sizeof(float);
+        auto run_mgpu_pair = [&](const float *h_src, float **d_lya, float **d_lw) -> bool {
+            *d_lya = (float *)p21_cuda_pool_alloc(fbytes, stream);
+            *d_lw = (float *)p21_cuda_pool_alloc(fbytes, stream);
+            if (!*d_lya || !*d_lw ||
+                !P21_CUDA_OK(cudaMemcpyAsync(*d_lya, h_src, fbytes, cudaMemcpyHostToDevice, stream))) {
+                return false;
+            }
+            return mgpu_filter_device_real_pair(
+                *d_lya, *d_lw, nx, ny, nz, box_len, ncf, lya_filter_type,
+                FILTER_SPHERICAL_SHELL_STRAIGHT_LINE, R_inner, R_outer, R_star, stream);
+        };
+        ok = run_mgpu_pair(emissivity_fields->sfrd_acg, &d_sfr_acg_lya, &d_sfr_acg_lw) &&
+             filter_one_ephemeral_shell(emissivity_fields->xray_emissivity, nx, ny, nz, box_len, ncf,
+                                        R_ct, R_inner, R_outer, R_star,
+                                        FILTER_SPHERICAL_SHELL_STRAIGHT_LINE, false, &d_xray_filt,
+                                        &d_k_unused, stream) &&
+             run_mgpu_pair(emissivity_fields->sfrd_mcg, &d_sfr_mcg_lya, &d_sfr_mcg_lw);
+    } else {
+        ok = filter_one_ephemeral_shell(emissivity_fields->sfrd_acg, nx, ny, nz, box_len, ncf, R_ct,
                                         R_inner, R_outer, R_star, lya_filter_type, keep_k_lw,
-                                        &d_sfr_mcg_lya, &d_k_mcg, stream);
-        if (ok && lya_ms) {
-            if (R_ct > 0 && R_inner > 0.0) {
-                ok = filter_from_existing_kspace(d_k_acg, nx, ny, nz, box_len, ncf, R_inner,
-                                                 R_outer, R_star, &d_sfr_acg_lw, stream) &&
-                     filter_from_existing_kspace(d_k_mcg, nx, ny, nz, box_len, ncf, R_inner,
-                                                 R_outer, R_star, &d_sfr_mcg_lw, stream);
-            } else {
-                ok = filter_one_ephemeral_shell(
-                         emissivity_fields->sfrd_acg, nx, ny, nz, box_len, ncf, R_ct, R_inner,
-                         R_outer, R_star, FILTER_SPHERICAL_SHELL_STRAIGHT_LINE, false, &d_sfr_acg_lw,
-                         &d_k_unused, stream) &&
-                     filter_one_ephemeral_shell(
-                         emissivity_fields->sfrd_mcg, nx, ny, nz, box_len, ncf, R_ct, R_inner,
-                         R_outer, R_star, FILTER_SPHERICAL_SHELL_STRAIGHT_LINE, false, &d_sfr_mcg_lw,
-                         &d_k_unused, stream);
+                                        &d_sfr_acg_lya, &d_k_acg, stream) &&
+             filter_one_ephemeral_shell(emissivity_fields->xray_emissivity, nx, ny, nz, box_len,
+                                        ncf, R_ct, R_inner, R_outer, R_star,
+                                        FILTER_SPHERICAL_SHELL_STRAIGHT_LINE, false, &d_xray_filt,
+                                        &d_k_unused, stream);
+
+        if (ok && use_mcgs) {
+            ok = filter_one_ephemeral_shell(emissivity_fields->sfrd_mcg, nx, ny, nz, box_len, ncf,
+                                            R_ct, R_inner, R_outer, R_star, lya_filter_type,
+                                            keep_k_lw, &d_sfr_mcg_lya, &d_k_mcg, stream);
+            if (ok && lya_ms) {
+                if (R_ct > 0 && R_inner > 0.0) {
+                    ok = filter_from_existing_kspace(d_k_acg, nx, ny, nz, box_len, ncf, R_inner,
+                                                     R_outer, R_star, &d_sfr_acg_lw, stream) &&
+                         filter_from_existing_kspace(d_k_mcg, nx, ny, nz, box_len, ncf, R_inner,
+                                                     R_outer, R_star, &d_sfr_mcg_lw, stream);
+                } else {
+                    ok = filter_one_ephemeral_shell(
+                             emissivity_fields->sfrd_acg, nx, ny, nz, box_len, ncf, R_ct, R_inner,
+                             R_outer, R_star, FILTER_SPHERICAL_SHELL_STRAIGHT_LINE, false,
+                             &d_sfr_acg_lw, &d_k_unused, stream) &&
+                         filter_one_ephemeral_shell(
+                             emissivity_fields->sfrd_mcg, nx, ny, nz, box_len, ncf, R_ct, R_inner,
+                             R_outer, R_star, FILTER_SPHERICAL_SHELL_STRAIGHT_LINE, false,
+                             &d_sfr_mcg_lw, &d_k_unused, stream);
+                }
             }
         }
     }
@@ -1488,6 +1575,7 @@ extern "C" int p21_cuda_compute_radiation_shells(float redshift, int n_shells, c
     }
 
     const bool need_k_unfilt = (use_mcgs && lya_ms);
+    const bool mgpu_eor = p21_mgpu_eor_enabled(total);
     float *d_sfr_acg_lya = (float *)p21_cuda_pool_alloc(fbytes, stream);
     float *d_xray_filt = (float *)p21_cuda_pool_alloc(fbytes, stream);
     float *d_sfr_mcg_lya = use_mcgs ? (float *)p21_cuda_pool_alloc(fbytes, stream) : nullptr;
@@ -1495,12 +1583,22 @@ extern "C" int p21_cuda_compute_radiation_shells(float redshift, int n_shells, c
         need_k_unfilt ? (float *)p21_cuda_pool_alloc(fbytes, stream) : nullptr;
     float *d_sfr_mcg_lw =
         need_k_unfilt ? (float *)p21_cuda_pool_alloc(fbytes, stream) : nullptr;
-    cufftComplex *d_k_unfilt =
-        need_k_unfilt ? (cufftComplex *)p21_cuda_pool_alloc(cbytes, stream) : nullptr;
-    cufftComplex *d_k_work = (cufftComplex *)p21_cuda_pool_alloc(cbytes, stream);
+    P21MgpuGrid mgpu_grid{};
+    std::vector<cufftComplex *> y_unfilt, y_work;
+    cufftComplex *d_k_unfilt = nullptr;
+    cufftComplex *d_k_work = nullptr;
+    bool k_alloc_ok = true;
+    if (mgpu_eor) {
+        k_alloc_ok = mgpu_grid.init(nx, ny, nz) && mgpu_alloc_rad_slabs(mgpu_grid, y_work) &&
+                     (!need_k_unfilt || mgpu_alloc_rad_slabs(mgpu_grid, y_unfilt));
+    } else {
+        d_k_unfilt =
+            need_k_unfilt ? (cufftComplex *)p21_cuda_pool_alloc(cbytes, stream) : nullptr;
+        d_k_work = (cufftComplex *)p21_cuda_pool_alloc(cbytes, stream);
+        k_alloc_ok = (d_k_work != nullptr) && (!need_k_unfilt || d_k_unfilt != nullptr);
+    }
 
-    bool ok = d_sfr_acg_lya && d_xray_filt && d_k_work &&
-              (!need_k_unfilt || d_k_unfilt) && (!use_mcgs || d_sfr_mcg_lya) &&
+    bool ok = d_sfr_acg_lya && d_xray_filt && k_alloc_ok && (!use_mcgs || d_sfr_mcg_lya) &&
               (!need_k_unfilt || (d_sfr_acg_lw && d_sfr_mcg_lw));
 
     for (int s = 0; ok && s < n_shells; ++s) {
@@ -1532,6 +1630,29 @@ extern "C" int p21_cuda_compute_radiation_shells(float redshift, int n_shells, c
             lerp_field_kernel<<<grid, kBlockThreads, 0, stream>>>(total, d_desc, d_prog, w, d_out,
                                                                   0);
             if (!P21_CUDA_OK(cudaGetLastError())) return false;
+            if (mgpu_eor) {
+                if (also_lw && d_out_lw) {
+                    return p21_mgpu_r2c_from_device(mgpu_grid, d_out, stream, 1.0,
+                                                    y_unfilt.data(), nullptr) &&
+                           p21_mgpu_filter_yslabs(mgpu_grid, y_unfilt.data(), y_work.data(),
+                                                  box_len, ncf, ftype, (float)R_inner,
+                                                  (float)R_outer, (float)R_star, pre_scale) &&
+                           p21_mgpu_c2r_to_device(mgpu_grid, y_work.data(), d_out, stream,
+                                                  nullptr) &&
+                           p21_mgpu_filter_yslabs(mgpu_grid, y_unfilt.data(), y_work.data(),
+                                                  box_len, ncf, FILTER_SPHERICAL_SHELL_STRAIGHT_LINE,
+                                                  (float)R_inner, (float)R_outer, (float)R_star,
+                                                  pre_scale) &&
+                           p21_mgpu_c2r_to_device(mgpu_grid, y_work.data(), d_out_lw, stream,
+                                                  nullptr);
+                }
+                return p21_mgpu_r2c_from_device(mgpu_grid, d_out, stream, 1.0, y_work.data(),
+                                                nullptr) &&
+                       p21_mgpu_filter_yslabs(mgpu_grid, y_work.data(), y_work.data(), box_len, ncf,
+                                              ftype, (float)R_inner, (float)R_outer, (float)R_star,
+                                              pre_scale) &&
+                       p21_mgpu_c2r_to_device(mgpu_grid, y_work.data(), d_out, stream, nullptr);
+            }
             if (also_lw && d_out_lw && d_k_unfilt) {
                 return p21_cuda_fft_r2c(d_out, d_k_unfilt, nx, ny, nz, false, stream) &&
                        p21_cuda_copy_and_filter_box(d_k_unfilt, d_k_work, nx, ny, nz, box_len, ncf,
@@ -1582,6 +1703,11 @@ extern "C" int p21_cuda_compute_radiation_shells(float redshift, int n_shells, c
     p21_cuda_pool_free(d_sfr_mcg_lw, stream);
     p21_cuda_pool_free(d_k_unfilt, stream);
     p21_cuda_pool_free(d_k_work, stream);
+    if (mgpu_eor) {
+        mgpu_free_rad_slabs(mgpu_grid, y_unfilt);
+        mgpu_free_rad_slabs(mgpu_grid, y_work);
+        mgpu_grid.destroy();
+    }
 
     if (!ok) {
         free_accum_entry(&accum, stream);

@@ -48,7 +48,7 @@ _GRID_RECOMMENDATIONS = [
         "grid": "2048^3 (8.59B, Single-Slab Zel'dovich / 2LPT)",
         "min_gpus_24gb": 3,
         "vram_per_gpu_gb": "~11.6 (3 GPUs)",
-        "host_ram_gb": "72 (Zel) / 235 (2LPT)",
+        "host_ram_gb": "72 (Zel) / <160 (2LPT)",
     },
 ]
 

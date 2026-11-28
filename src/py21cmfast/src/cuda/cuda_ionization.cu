@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "cuda_common.cuh"
+#include "cuda_mgpu.cuh"
 #include "cuda_tables.cuh"
 
 struct P21CudaIonCtx {
@@ -64,6 +65,19 @@ struct P21CudaIonCtx {
     cufftComplex *h_k_stars_unfilt = nullptr;
     cufftComplex *h_k_sfr_unfilt = nullptr;
     cufftComplex *d_k_work = nullptr;
+
+    /* Distributed multi-GPU Y-slab state (Direction P EoR multi-GPU) */
+    bool mgpu_mode = false;
+    P21MgpuGrid mgpu_grid{};
+    cufftComplex *y_deltax_unfilt[kMgpuMaxDevices]{};
+    cufftComplex *y_xe_unfilt[kMgpuMaxDevices]{};
+    cufftComplex *y_nrec_unfilt[kMgpuMaxDevices]{};
+    cufftComplex *y_mturn_acg_unfilt[kMgpuMaxDevices]{};
+    cufftComplex *y_prev_deltax_unfilt[kMgpuMaxDevices]{};
+    cufftComplex *y_mturn_mcg_unfilt[kMgpuMaxDevices]{};
+    cufftComplex *y_stars_unfilt[kMgpuMaxDevices]{};
+    cufftComplex *y_sfr_unfilt[kMgpuMaxDevices]{};
+    cufftComplex *y_work[kMgpuMaxDevices]{};
 
     /* Real-space work / filtered grids */
     float *d_real_work = nullptr;
@@ -1013,6 +1027,27 @@ void free_ion_rloop_scratch(P21CudaIonCtx *ctx) {
     hfree(ctx->h_k_sfr_unfilt);
 
     pfree(ctx->d_k_work);
+    auto yfree = [&](cufftComplex *(&ys)[kMgpuMaxDevices]) {
+        for (int g = 0; g < kMgpuMaxDevices; ++g) {
+            if (ys[g]) {
+                p21_mgpu_free(ctx->mgpu_grid.devs[g], ys[g], ctx->mgpu_grid.streams[g]);
+                ys[g] = nullptr;
+            }
+        }
+    };
+    if (ctx->mgpu_mode) {
+        yfree(ctx->y_deltax_unfilt);
+        yfree(ctx->y_xe_unfilt);
+        yfree(ctx->y_nrec_unfilt);
+        yfree(ctx->y_mturn_acg_unfilt);
+        yfree(ctx->y_prev_deltax_unfilt);
+        yfree(ctx->y_mturn_mcg_unfilt);
+        yfree(ctx->y_stars_unfilt);
+        yfree(ctx->y_sfr_unfilt);
+        yfree(ctx->y_work);
+        ctx->mgpu_grid.destroy();
+        ctx->mgpu_mode = false;
+    }
     pfree(ctx->d_real_work);
     pfree(ctx->d_deltax_filt);
     pfree(ctx->d_xe_filt);
@@ -1409,63 +1444,111 @@ extern "C" int p21_cuda_ion_prepare_r2c(P21CudaIonCtx *ctx, const P21IonBoxParam
         }
     }
 
+    ctx->mgpu_mode = p21_mgpu_eor_enabled(n) && ctx->mgpu_grid.init(ctx->nx, ctx->ny, ctx->nz);
+
     int spill_env = read_ion_spill_kspace_env();
     if (spill_env >= 0) {
         ctx->spill_kspace = (spill_env > 0);
     } else {
         p21_cuda_pool_trim();
-        size_t need_bytes = n_unfilt * cbytes + n_filt * fbytes + cbytes + fbytes;
-        ctx->spill_kspace = (need_bytes + (2ULL << 30) > p21_cuda_free_mem_bytes());
+        size_t need_bytes = ctx->mgpu_mode
+                                ? (n_filt * fbytes + fbytes +
+                                   (n_unfilt + 1) * cbytes /
+                                       (size_t)std::max(1, ctx->mgpu_grid.n_gpus))
+                                : (n_unfilt * cbytes + n_filt * fbytes + cbytes + fbytes);
+        size_t free_bytes =
+            ctx->mgpu_mode ? p21_mgpu_min_free_mem(ctx->mgpu_grid) : p21_cuda_free_mem_bytes();
+        ctx->spill_kspace = (need_bytes + (2ULL << 30) > free_bytes);
     }
 
     ctx->d_real_work = (float *)p21_cuda_pool_alloc(fbytes, stream);
-    ctx->d_k_work = (cufftComplex *)p21_cuda_pool_alloc(cbytes, stream);
-    bool ok = (ctx->d_real_work && ctx->d_k_work);
+    bool ok = (ctx->d_real_work != nullptr);
+    auto alloc_yslab = [&](cufftComplex *(&ys)[kMgpuMaxDevices]) -> bool {
+        for (int g = 0; g < ctx->mgpu_grid.n_gpus; ++g) {
+            ys[g] = (cufftComplex *)p21_mgpu_malloc(
+                ctx->mgpu_grid.devs[g], ctx->mgpu_grid.cplx_elems_y(g) * sizeof(cufftComplex),
+                ctx->mgpu_grid.streams[g]);
+            if (!ys[g]) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (ctx->mgpu_mode) {
+        if (ok) ok = alloc_yslab(ctx->y_work);
+    } else {
+        ctx->d_k_work = (cufftComplex *)p21_cuda_pool_alloc(cbytes, stream);
+        ok = ok && (ctx->d_k_work != nullptr);
+    }
 
-    auto alloc_unfilt = [&](cufftComplex *&d_ptr, cufftComplex *&h_ptr) {
+    auto alloc_unfilt = [&](cufftComplex *&d_ptr, cufftComplex *(&y_ptr)[kMgpuMaxDevices],
+                            cufftComplex *&h_ptr) {
         if (!ok) return;
         if (ctx->spill_kspace) {
             h_ptr = (cufftComplex *)malloc(cbytes);
             if (!h_ptr) ok = false;
+        } else if (ctx->mgpu_mode) {
+            if (!alloc_yslab(y_ptr)) ok = false;
         } else {
             d_ptr = (cufftComplex *)p21_cuda_pool_alloc(cbytes, stream);
             if (!d_ptr) ok = false;
         }
     };
 
-    alloc_unfilt(ctx->d_k_deltax_unfilt, ctx->h_k_deltax_unfilt);
+    alloc_unfilt(ctx->d_k_deltax_unfilt, ctx->y_deltax_unfilt, ctx->h_k_deltax_unfilt);
 
     if (ok && ctx->use_ts_fluct) {
-        alloc_unfilt(ctx->d_k_xe_unfilt, ctx->h_k_xe_unfilt);
+        alloc_unfilt(ctx->d_k_xe_unfilt, ctx->y_xe_unfilt, ctx->h_k_xe_unfilt);
     }
     if (ok && need_filter_recomb) {
-        alloc_unfilt(ctx->d_k_nrec_unfilt, ctx->h_k_nrec_unfilt);
+        alloc_unfilt(ctx->d_k_nrec_unfilt, ctx->y_nrec_unfilt, ctx->h_k_nrec_unfilt);
     }
     if (ok && params->lagrangian_source_grids) {
-        alloc_unfilt(ctx->d_k_stars_unfilt, ctx->h_k_stars_unfilt);
+        alloc_unfilt(ctx->d_k_stars_unfilt, ctx->y_stars_unfilt, ctx->h_k_stars_unfilt);
         if (ok && ctx->recomb_model != RECOMB_MODEL_NO) {
-            alloc_unfilt(ctx->d_k_sfr_unfilt, ctx->h_k_sfr_unfilt);
+            alloc_unfilt(ctx->d_k_sfr_unfilt, ctx->y_sfr_unfilt, ctx->h_k_sfr_unfilt);
         }
     } else if (ok) {
         if (ctx->use_reion_fb) {
-            alloc_unfilt(ctx->d_k_mturn_acg_unfilt, ctx->h_k_mturn_acg_unfilt);
+            alloc_unfilt(ctx->d_k_mturn_acg_unfilt, ctx->y_mturn_acg_unfilt,
+                         ctx->h_k_mturn_acg_unfilt);
         }
         if (ok && ctx->use_mcgs) {
-            alloc_unfilt(ctx->d_k_mturn_mcg_unfilt, ctx->h_k_mturn_mcg_unfilt);
+            alloc_unfilt(ctx->d_k_mturn_mcg_unfilt, ctx->y_mturn_mcg_unfilt,
+                         ctx->h_k_mturn_mcg_unfilt);
             if (ok && need_prev_deltax) {
-                alloc_unfilt(ctx->d_k_prev_deltax_unfilt, ctx->h_k_prev_deltax_unfilt);
+                alloc_unfilt(ctx->d_k_prev_deltax_unfilt, ctx->y_prev_deltax_unfilt,
+                             ctx->h_k_prev_deltax_unfilt);
             }
         }
     }
 
     if (!ok) {
-        p21_cuda_pool_free(ctx->d_real_work, stream);
-        ctx->d_real_work = nullptr;
+        free_ion_rloop_scratch(ctx);
         return -1;
     }
 
-    auto store_k_result = [&](cufftComplex *d_k_buf, cufftComplex *h_k_dst) -> bool {
+    auto store_k_result = [&](cufftComplex *d_k_buf, cufftComplex *const *y_buf,
+                              cufftComplex *h_k_dst) -> bool {
         if (!ctx->spill_kspace) {
+            return true;
+        }
+        if (ctx->mgpu_mode) {
+            size_t off = 0;
+            for (int g = 0; g < ctx->mgpu_grid.n_gpus; ++g) {
+                size_t elems = ctx->mgpu_grid.cplx_elems_y(g);
+                if (!P21_CUDA_OK(cudaSetDevice(ctx->mgpu_grid.devs[g])) ||
+                    !P21_CUDA_OK(cudaMemcpyAsync(h_k_dst + off, y_buf[g],
+                                                 elems * sizeof(cufftComplex),
+                                                 cudaMemcpyDeviceToHost,
+                                                 ctx->mgpu_grid.streams[g])) ||
+                    !P21_CUDA_OK(cudaStreamSynchronize(ctx->mgpu_grid.streams[g]))) {
+                    cudaSetDevice(ctx->mgpu_grid.primary_dev);
+                    return false;
+                }
+                off += elems;
+            }
+            cudaSetDevice(ctx->mgpu_grid.primary_dev);
             return true;
         }
         return P21_CUDA_OK(cudaMemcpyAsync(h_k_dst, d_k_buf, cbytes, cudaMemcpyDeviceToHost,
@@ -1473,63 +1556,83 @@ extern "C" int p21_cuda_ion_prepare_r2c(P21CudaIonCtx *ctx, const P21IonBoxParam
                P21_CUDA_OK(cudaStreamSynchronize(stream));
     };
 
-    auto prepare_grid = [&](const float *d_src, cufftComplex *d_k_out, cufftComplex *h_k_out,
-                            double scale, double lo, double hi) -> bool {
-        cufftComplex *k_target = ctx->spill_kspace ? ctx->d_k_work : d_k_out;
+    auto prepare_grid = [&](const float *d_src, cufftComplex *d_k_out,
+                            cufftComplex *const *y_k_out, cufftComplex *h_k_out, double scale,
+                            double lo, double hi) -> bool {
         clip_and_scale_kernel<<<grid, kBlockThreads, 0, stream>>>(d_src, ctx->d_real_work, n,
                                                                   scale, lo, hi);
         if (!P21_CUDA_OK(cudaGetLastError())) return false;
+        if (ctx->mgpu_mode) {
+            cufftComplex *const *y_target = ctx->spill_kspace ? ctx->y_work : y_k_out;
+            if (!p21_mgpu_r2c_from_device(ctx->mgpu_grid, ctx->d_real_work, stream, (double)inv_n,
+                                          const_cast<cufftComplex **>(y_target), nullptr)) {
+                return false;
+            }
+            return store_k_result(nullptr, y_target, h_k_out);
+        }
+        cufftComplex *k_target = ctx->spill_kspace ? ctx->d_k_work : d_k_out;
         if (!p21_cuda_fft_r2c(ctx->d_real_work, k_target, ctx->nx, ctx->ny, ctx->nz, false,
                               stream)) {
             return false;
         }
         scale_complex_kernel<<<kgrid, kBlockThreads, 0, stream>>>(k_target, ctx->k_total, inv_n);
         if (!P21_CUDA_OK(cudaGetLastError())) return false;
-        return store_k_result(k_target, h_k_out);
+        return store_k_result(k_target, nullptr, h_k_out);
     };
 
     auto prepare_precomputed = [&](const float *d_src_real, cufftComplex *d_k_out,
+                                   cufftComplex *const *y_k_out,
                                    cufftComplex *h_k_out) -> bool {
+        if (ctx->mgpu_mode) {
+            cufftComplex *const *y_target = ctx->spill_kspace ? ctx->y_work : y_k_out;
+            if (!p21_mgpu_r2c_from_device(ctx->mgpu_grid, d_src_real, stream, (double)inv_n,
+                                          const_cast<cufftComplex **>(y_target), nullptr)) {
+                return false;
+            }
+            return store_k_result(nullptr, y_target, h_k_out);
+        }
         cufftComplex *k_target = ctx->spill_kspace ? ctx->d_k_work : d_k_out;
         if (!p21_cuda_fft_r2c(d_src_real, k_target, ctx->nx, ctx->ny, ctx->nz, false, stream)) {
             return false;
         }
         scale_complex_kernel<<<kgrid, kBlockThreads, 0, stream>>>(k_target, ctx->k_total, inv_n);
         if (!P21_CUDA_OK(cudaGetLastError())) return false;
-        return store_k_result(k_target, h_k_out);
+        return store_k_result(k_target, nullptr, h_k_out);
     };
 
-    ok = prepare_grid(ctx->d_dens, ctx->d_k_deltax_unfilt, ctx->h_k_deltax_unfilt,
-                      params->photoncons_adjustment_factor, -1.0, 1e6);
+    ok = prepare_grid(ctx->d_dens, ctx->d_k_deltax_unfilt, ctx->y_deltax_unfilt,
+                      ctx->h_k_deltax_unfilt, params->photoncons_adjustment_factor, -1.0, 1e6);
     if (ok && params->lagrangian_source_grids) {
-        ok = prepare_grid(ctx->d_stars_in, ctx->d_k_stars_unfilt, ctx->h_k_stars_unfilt, 1.0, 0.0,
-                          1e20);
+        ok = prepare_grid(ctx->d_stars_in, ctx->d_k_stars_unfilt, ctx->y_stars_unfilt,
+                          ctx->h_k_stars_unfilt, 1.0, 0.0, 1e20);
         if (ok && ctx->recomb_model != RECOMB_MODEL_NO) {
-            ok = prepare_grid(ctx->d_sfr_in, ctx->d_k_sfr_unfilt, ctx->h_k_sfr_unfilt, 1.0, 0.0,
-                              1e20);
+            ok = prepare_grid(ctx->d_sfr_in, ctx->d_k_sfr_unfilt, ctx->y_sfr_unfilt,
+                              ctx->h_k_sfr_unfilt, 1.0, 0.0, 1e20);
         }
     } else if (ok) {
         if (ctx->use_reion_fb) {
             ok = prepare_precomputed(ctx->d_mturn_acg_real, ctx->d_k_mturn_acg_unfilt,
-                                     ctx->h_k_mturn_acg_unfilt);
+                                     ctx->y_mturn_acg_unfilt, ctx->h_k_mturn_acg_unfilt);
         }
         if (ok && ctx->use_mcgs) {
             if (need_prev_deltax) {
                 ok = prepare_grid(ctx->d_prev_dens, ctx->d_k_prev_deltax_unfilt,
-                                  ctx->h_k_prev_deltax_unfilt, 1.0, -1.0, 1e6);
+                                  ctx->y_prev_deltax_unfilt, ctx->h_k_prev_deltax_unfilt, 1.0,
+                                  -1.0, 1e6);
             }
             if (ok) {
                 ok = prepare_precomputed(ctx->d_mturn_mcg_real, ctx->d_k_mturn_mcg_unfilt,
-                                         ctx->h_k_mturn_mcg_unfilt);
+                                         ctx->y_mturn_mcg_unfilt, ctx->h_k_mturn_mcg_unfilt);
             }
         }
     }
     if (ok && ctx->use_ts_fluct) {
-        ok = prepare_grid(ctx->d_ts_xe, ctx->d_k_xe_unfilt, ctx->h_k_xe_unfilt, 1.0, 0.0, 1.0);
+        ok = prepare_grid(ctx->d_ts_xe, ctx->d_k_xe_unfilt, ctx->y_xe_unfilt, ctx->h_k_xe_unfilt,
+                          1.0, 0.0, 1.0);
     }
     if (ok && need_filter_recomb) {
-        ok = prepare_grid(ctx->d_prev_nrec, ctx->d_k_nrec_unfilt, ctx->h_k_nrec_unfilt, 1.0, 0.0,
-                          1e20);
+        ok = prepare_grid(ctx->d_prev_nrec, ctx->d_k_nrec_unfilt, ctx->y_nrec_unfilt,
+                          ctx->h_k_nrec_unfilt, 1.0, 0.0, 1e20);
     }
 
     p21_cuda_pool_free(ctx->d_real_work, stream);
@@ -1586,8 +1689,55 @@ extern "C" int p21_cuda_ion_filter_and_extrema(P21CudaIonCtx *ctx, const P21IonB
     const bool need_prev_deltax =
         (!params->lagrangian_source_grids && ctx->use_mcgs && !ctx->prev_first_z);
 
-    auto filter_and_c2r = [&](const cufftComplex *d_k_unfilt, const cufftComplex *h_k_unfilt,
-                              float *d_real_out, int ftype, float R_param) -> bool {
+    auto filter_and_c2r = [&](const cufftComplex *d_k_unfilt, cufftComplex *const *y_k_unfilt,
+                              const cufftComplex *h_k_unfilt, float *d_real_out, int ftype,
+                              float R_param) -> bool {
+        if (ctx->mgpu_mode) {
+            cufftComplex *const *src_y = y_k_unfilt;
+            if (ctx->spill_kspace) {
+                if (!h_k_unfilt) {
+                    return false;
+                }
+                size_t off = 0;
+                for (int g = 0; g < ctx->mgpu_grid.n_gpus; ++g) {
+                    size_t elems = ctx->mgpu_grid.cplx_elems_y(g);
+                    if (!P21_CUDA_OK(cudaSetDevice(ctx->mgpu_grid.devs[g])) ||
+                        !P21_CUDA_OK(cudaMemcpyAsync(ctx->y_work[g], h_k_unfilt + off,
+                                                     elems * sizeof(cufftComplex),
+                                                     cudaMemcpyHostToDevice,
+                                                     ctx->mgpu_grid.streams[g])) ||
+                        !P21_CUDA_OK(cudaStreamSynchronize(ctx->mgpu_grid.streams[g]))) {
+                        cudaSetDevice(ctx->mgpu_grid.primary_dev);
+                        return false;
+                    }
+                    off += elems;
+                }
+                cudaSetDevice(ctx->mgpu_grid.primary_dev);
+                src_y = ctx->y_work;
+            }
+            if (rspec->R_index > 0) {
+                if (!p21_mgpu_filter_yslabs(ctx->mgpu_grid, src_y, ctx->y_work, box_len, ncf,
+                                            ftype, (float)rspec->R, R_param, 0.0f, 1.0f)) {
+                    return false;
+                }
+            } else if (!ctx->spill_kspace) {
+                for (int g = 0; g < ctx->mgpu_grid.n_gpus; ++g) {
+                    size_t elems = ctx->mgpu_grid.cplx_elems_y(g);
+                    if (!P21_CUDA_OK(cudaSetDevice(ctx->mgpu_grid.devs[g])) ||
+                        !P21_CUDA_OK(cudaMemcpyAsync(ctx->y_work[g], y_k_unfilt[g],
+                                                     elems * sizeof(cufftComplex),
+                                                     cudaMemcpyDeviceToDevice,
+                                                     ctx->mgpu_grid.streams[g])) ||
+                        !P21_CUDA_OK(cudaStreamSynchronize(ctx->mgpu_grid.streams[g]))) {
+                        cudaSetDevice(ctx->mgpu_grid.primary_dev);
+                        return false;
+                    }
+                }
+                cudaSetDevice(ctx->mgpu_grid.primary_dev);
+            }
+            return p21_mgpu_c2r_to_device(ctx->mgpu_grid, ctx->y_work, d_real_out, stream, nullptr);
+        }
+
         const cufftComplex *src_for_filter = d_k_unfilt;
         if (ctx->spill_kspace) {
             if (!h_k_unfilt ||
@@ -1613,38 +1763,41 @@ extern "C" int p21_cuda_ion_filter_and_extrema(P21CudaIonCtx *ctx, const P21IonB
                                 stream);
     };
 
-    bool ok = filter_and_c2r(ctx->d_k_deltax_unfilt, ctx->h_k_deltax_unfilt, ctx->d_deltax_filt,
-                             params->hii_filter, 0.0f);
+    bool ok = filter_and_c2r(ctx->d_k_deltax_unfilt, ctx->y_deltax_unfilt, ctx->h_k_deltax_unfilt,
+                             ctx->d_deltax_filt, params->hii_filter, 0.0f);
     if (ok && ctx->use_ts_fluct) {
-        ok = filter_and_c2r(ctx->d_k_xe_unfilt, ctx->h_k_xe_unfilt, ctx->d_xe_filt,
-                            params->hii_filter, 0.0f);
+        ok = filter_and_c2r(ctx->d_k_xe_unfilt, ctx->y_xe_unfilt, ctx->h_k_xe_unfilt,
+                            ctx->d_xe_filt, params->hii_filter, 0.0f);
     }
     if (ok && need_filter_recomb) {
-        ok = filter_and_c2r(ctx->d_k_nrec_unfilt, ctx->h_k_nrec_unfilt, ctx->d_nrec_filt,
-                            params->hii_filter, 0.0f);
+        ok = filter_and_c2r(ctx->d_k_nrec_unfilt, ctx->y_nrec_unfilt, ctx->h_k_nrec_unfilt,
+                            ctx->d_nrec_filt, params->hii_filter, 0.0f);
     }
     if (ok && params->lagrangian_source_grids) {
         int hf_type = ctx->use_exp_filter ? FILTER_EXP_MFP : params->hii_filter;
         float mfp_p = (float)params->mfp_meandens;
-        ok = filter_and_c2r(ctx->d_k_stars_unfilt, ctx->h_k_stars_unfilt, ctx->d_stars_filt,
-                            hf_type, mfp_p);
+        ok = filter_and_c2r(ctx->d_k_stars_unfilt, ctx->y_stars_unfilt, ctx->h_k_stars_unfilt,
+                            ctx->d_stars_filt, hf_type, mfp_p);
         if (ok && ctx->recomb_model != RECOMB_MODEL_NO) {
-            ok = filter_and_c2r(ctx->d_k_sfr_unfilt, ctx->h_k_sfr_unfilt, ctx->d_sfr_filt, hf_type,
-                                mfp_p);
+            ok = filter_and_c2r(ctx->d_k_sfr_unfilt, ctx->y_sfr_unfilt, ctx->h_k_sfr_unfilt,
+                                ctx->d_sfr_filt, hf_type, mfp_p);
         }
     } else if (ok) {
         if (ctx->use_reion_fb) {
-            ok = filter_and_c2r(ctx->d_k_mturn_acg_unfilt, ctx->h_k_mturn_acg_unfilt,
-                                ctx->d_mturn_acg_real, params->hii_filter, 0.0f);
+            ok = filter_and_c2r(ctx->d_k_mturn_acg_unfilt, ctx->y_mturn_acg_unfilt,
+                                ctx->h_k_mturn_acg_unfilt, ctx->d_mturn_acg_real,
+                                params->hii_filter, 0.0f);
         }
         if (ok && ctx->use_mcgs) {
             if (need_prev_deltax) {
-                ok = filter_and_c2r(ctx->d_k_prev_deltax_unfilt, ctx->h_k_prev_deltax_unfilt,
-                                    ctx->d_prev_deltax_filt, params->hii_filter, 0.0f);
+                ok = filter_and_c2r(ctx->d_k_prev_deltax_unfilt, ctx->y_prev_deltax_unfilt,
+                                    ctx->h_k_prev_deltax_unfilt, ctx->d_prev_deltax_filt,
+                                    params->hii_filter, 0.0f);
             }
             if (ok) {
-                ok = filter_and_c2r(ctx->d_k_mturn_mcg_unfilt, ctx->h_k_mturn_mcg_unfilt,
-                                    ctx->d_mturn_mcg_real, params->hii_filter, 0.0f);
+                ok = filter_and_c2r(ctx->d_k_mturn_mcg_unfilt, ctx->y_mturn_mcg_unfilt,
+                                    ctx->h_k_mturn_mcg_unfilt, ctx->d_mturn_mcg_real,
+                                    params->hii_filter, 0.0f);
             }
         }
     }

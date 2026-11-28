@@ -55,7 +55,8 @@ jobs:
             tests/native/test_21cmcu_phase10_cpu_opt.py \
             tests/native/test_21cmcu_phase11_batchpool_sbi.py \
             tests/native/test_21cmcu_phase12_topology.py \
-            tests/native/test_21cmcu_phase13_fisher_multiprobe.py
+            tests/native/test_21cmcu_phase13_fisher_multiprobe.py \
+            tests/native/test_21cmcu_phase15_direction_p.py
 
   packaging-smoke:
     runs-on: ubuntu-latest
@@ -86,7 +87,7 @@ jobs:
           from pathlib import Path
           import py21cmcu
           assert py21cmcu.__version__ == "0.9.0", py21cmcu.__version__
-          assert py21cmcu.cuda_api_count() >= 46, py21cmcu.cuda_api_count()
+          assert py21cmcu.cuda_api_count() >= 47, py21cmcu.cuda_api_count()
           assert (Path(py21cmcu.__file__).parent / "py.typed").is_file()
           PY
           /tmp/wheel-venv/bin/21cmcu version --as-json
